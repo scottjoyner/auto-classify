@@ -109,6 +109,21 @@ python batchrunner.py status
 This is generic: any resumable batch command (re-index, backfill, embed) drops in as a
 new manifest with a priority — the dispatcher orders and gates them all.
 
+### Per-slice side-effects + auto-completion
+
+- **`post_slice`** (optional): a shell command run AFTER each successful slice (not in
+  dry-run). Used by `faces_full` to `docker cp` the fresh `face_embeddings.jsonl` +
+  `face_clusters.jsonl` + `faces.done` out of the container, then run `graph_faces.py`
+  — so face progress is queryable in Neo4j incrementally, not all-at-once at the end.
+- **`done_file` + `complete_when: done_file_stable`**: the dispatcher counts lines in
+  `done_file` each tick. When it stops growing between ticks (and ≥1 slice has run),
+  the resumable job has drained and the manifest is auto-marked `complete` — no manual
+  "is it done?" check. `faces_full` uses this: `faces.done` stops growing ⇒ 41k images
+  ingested ⇒ status flips to `complete`.
+
+State (slices run, last run, done-file line count, status) persists in `batch_state.json`;
+`python batchrunner.py status` shows it.
+
 ### Two job types
 
 - **`type: slice`** (e.g. `faces_full`): one-shot, resumable command driven in
