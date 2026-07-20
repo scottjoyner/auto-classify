@@ -95,6 +95,57 @@ def alert(job, event, message, severity="warn"):
     except Exception as e:
         print(f"[batchrunner] alert: nextcloud failed: {e}", file=sys.stderr, flush=True)
 
+def alerts_cmd(args):
+    """Handle `ack` and `list-alerts` subcommands (Neo4j-backed alert store)."""
+    from neo4j import GraphDatabase
+    d = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    try:
+        if args.action == "list-alerts":
+            where = "WHERE a.acknowledged=false"
+            params = {}
+            if args.job:
+                where += " AND a.job=$job"; params["job"] = args.job
+            with d.session() as s:
+                rows = s.run(
+                    f"MATCH (a:BatchJobAlert) {where} "
+                    "RETURN a.job AS job, a.event AS event, a.severity AS sev, "
+                    "a.ts AS ts, a.message AS msg ORDER BY a.ts DESC", **params).data()
+            if not rows:
+                print("[batchrunner] no unacknowledged alerts.")
+            for r in rows:
+                print(f"  {r['ts']} [{r['sev'].upper()}] {r['job']}:{r['event']}  {r['msg'][:90]}")
+            print(f"[batchrunner] {len(rows)} unacked alert(s).")
+            return
+
+        # ack
+        if not (args.all or args.job):
+            print("[batchrunner] ack requires --all or --job <name> [--event <e>]",
+                  file=sys.stderr); sys.exit(2)
+        where = "WHERE a.acknowledged=false"
+        params = {}
+        if not args.all and args.job:
+            where += " AND a.job=$job"; params["job"] = args.job
+            if args.event:
+                where += " AND a.event=$event"; params["event"] = args.event
+        with d.session() as s:
+            res = s.run(
+                f"MATCH (a:BatchJobAlert) {where} "
+                "SET a.acknowledged=true RETURN count(a) AS n", **params).data()
+            n = res[0]["n"] if res else 0
+        # also clear last_alert in batch_state.json so the job can re-alert if it recurs
+        if n and args.job:
+            st = load_state()
+            prog = st.get(args.job)
+            if prog and prog.get("last_alert"):
+                prog.pop("last_alert", None)
+                st[args.job] = prog
+                save_state(st)
+                print(f"[batchrunner] cleared last_alert for {args.job} in batch_state.json")
+        print(f"[batchrunner] acknowledged {n} alert(s).")
+    finally:
+        d.close()
+
+
 def load_manifests():
     import glob, yaml
     out = []
@@ -247,7 +298,13 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print decisions, execute nothing")
     ap.add_argument("--force", help="run a specific job name regardless of gates (dry unless --execute)")
     ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--job", help="ack/list-alerts: filter by job name")
+    ap.add_argument("--event", help="ack: filter by event (stuck|max_failures)")
+    ap.add_argument("--all", action="store_true", help="ack: acknowledge all unacked alerts")
     args = ap.parse_args()
+
+    if args.action in ("ack", "list-alerts"):
+        return alerts_cmd(args)
 
     if not os.path.exists(BATCH_DIR):
         print(f"[batchrunner] no {BATCH_DIR}", file=sys.stderr); sys.exit(1)
