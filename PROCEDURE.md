@@ -84,6 +84,32 @@ python batchrunner.py --force faces_full --execute
 - **Completion:** a `slice` job with `done_file_stable` auto-flips to `complete` when the
   done-file is stable for one tick after ≥1 slice — no manual "is it done?" check.
 
+## Alerting (a silent STUCK/maxfail is a critical gap)
+
+When a job transitions to `STUCK` or hits `max_failures`, `alert()` fires to THREE
+reachable channels (no browser-approval needed) so it is never silent:
+1. **Neo4j** — `MERGE (:BatchJobAlert {key:job:event:date})` with severity/message/ts/
+   `acknowledged=false`. Persistent + queryable by any agent/Sophia. Acknowledge by
+   setting `acknowledged=true` (or clearing the job's `status` in `batch_state.json`).
+2. **`alerts.log`** (repo-local) — always works, easy to tail.
+3. **Nextcloud note** — appends to `HermesAlerts/batch_jobs.md` (Scott sees it on his
+   phone via the Nextcloud app).
+
+Fires ONCE per incident (`last_alert` state is set on fire, cleared on recovery) — no
+spam every tick. Each channel is wrapped in try/except so one failing never breaks the
+dispatcher. **Signal is intentionally NOT used**: outbound Signal lives on x1-370 and SSH
+to it is Tailscale-SSH (needs browser approval headless) — unreliable from this host.
+
+Query unacknowledged alerts (Python Bolt driver — NOT the MCP read tool, which has a 120s
+circuit-breaker that returns stale counts):
+```
+from neo4j import GraphDatabase
+d=GraphDatabase.driver('bolt://100.64.43.123:7687',auth=('neo4j','knowledge_graph_2026'))
+with d.session() as s:
+    for r in s.run('MATCH (a:BatchJobAlert) WHERE a.acknowledged=false RETURN a.job,a.event,a.ts'):
+        print(r)
+```
+
 ## Diagnosing a stuck / failed job
 
 ```
