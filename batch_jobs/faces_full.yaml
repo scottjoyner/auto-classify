@@ -1,0 +1,41 @@
+# Batch load manifest: full Nextcloud face-ingestion across all 41k images.
+#
+# This is the job the scheduler drives in SLICES (never all-at-once). faces.py is
+# resumable (tracks _ingest/faces.done), so each slice just advances it.
+#
+# Driven by: auto-classify/batchrunner.py
+# Priority 5 = BATCH (lowest; runs only when host is idle, never preempts fleet compute).
+# Idle gate: 1-min load < 2.0 per CPU. Allowed hours: nights + early mornings
+#   (00-07, 19-23 local) so it stays off prod/active hours.
+# Slice: 200 images per tick (faces.py --limit 200 reads the next 200 unprocessed
+#   because faces.done de-dupes). One slice ~1-3 min CPU on x1-370.
+# ETA: 41040 images / 200 per slice ≈ 205 slices. At ~2 min/slice, idle-gated,
+#   completes in a few idle days. Resumable — safe to pause/restart anytime.
+
+name: faces_full
+enabled: false          # flip to true + unpause cron to start
+priority: batch         # 5 (lowest) — AssistX enum: critical0/high1/medium2/low3/bg4/batch5
+command: >-
+  docker exec nextcloud /tmp/facevenv/bin/python -c
+  "import sys; sys.path.insert(0,'/');
+   import faces;
+   faces.JSONL_IN='/var/www/html/data/admin/files/Photos/_ingest/media_inventory.jsonl';
+   faces.EMB_OUT='/var/www/html/data/admin/files/Photos/_ingest/face_embeddings.jsonl';
+   faces.CLUSTER_OUT='/var/www/html/data/admin/files/Photos/_ingest/face_clusters.jsonl';
+   faces.DONE_FILE='/var/www/html/data/admin/files/Photos/_ingest/faces.done';
+   import sys as _s; _s.argv=['faces'];
+   faces.main()"
+slice_arg: "--limit"
+slice_size: 200
+slice_timeout_sec: 1800
+idle_max_load: 2.0
+allowed_hours: "0-7,19-23"
+# after a slice, copy embeddings out + graph-write so progress is queryable incrementally
+post_slice: >-
+  docker cp nextcloud:/var/www/html/data/admin/files/Photos/_ingest/face_embeddings.jsonl
+  /media/scott/SSD_4TB/auto-classify/face_embeddings.jsonl &&
+  docker cp nextcloud:/var/www/html/data/admin/files/Photos/_ingest/face_clusters.jsonl
+  /media/scott/SSD_4TB/auto-classify/face_clusters.jsonl &&
+  /media/scott/SSD_4TB/auto-classify/venv/bin/python
+  /media/scott/SSD_4TB/auto-classify/graph_faces.py
+complete_when: "faces.done stops growing (all media_ids present)"

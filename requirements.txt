@@ -1,0 +1,6 @@
+# auto-classify runtime deps
+# host (x1-370): graph writes + batchrunner dispatcher
+neo4j>=5.0
+pyyaml>=6.0
+# container (nextcloud /tmp/facevenv): extraction + face detection
+#   Pillow, insightface, onnxruntime, opencv-python-headless  (installed inside container)

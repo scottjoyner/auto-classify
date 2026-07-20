@@ -7,3 +7,5 @@ media_inventory.jsonl
 face_embeddings.jsonl
 face_clusters.jsonl
 *.log
+batch_state.json
+batchrunner.pid
