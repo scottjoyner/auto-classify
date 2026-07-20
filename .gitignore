@@ -2,3 +2,8 @@ venv/
 __pycache__/
 *.pyc
 _ingest/
+
+media_inventory.jsonl
+face_embeddings.jsonl
+face_clusters.jsonl
+*.log
