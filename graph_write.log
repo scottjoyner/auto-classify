@@ -1,0 +1,17 @@
+[graph] 41040 unique media
+[graph] 119 SummaryPlace for GPS join
+[graph] building PhoneLog hour->place map (one heavy query)...
+[graph] hour->place map: 10494 hours
+[graph] assignment: located=12660 timefb=1955 noloc=26425
+[graph] merged 5000/41040 Media
+[graph] merged 10000/41040 Media
+[graph] merged 15000/41040 Media
+[graph] merged 20000/41040 Media
+[graph] merged 25000/41040 Media
+[graph] merged 30000/41040 Media
+[graph] merged 35000/41040 Media
+[graph] merged 40000/41040 Media
+[graph] merged 41040 Media nodes
+[graph] wrote 12660 LOCATED_AT edges
+[graph] wrote 1955 CAPTURED_AT_TIME edges
+[graph] DONE. located=12660 timefb=1955 noloc=26425
