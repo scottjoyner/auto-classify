@@ -110,6 +110,20 @@ with d.session() as s:
         print(r)
 ```
 
+## Managing alerts (Neo4j-backed)
+
+```
+python batchrunner.py list-alerts            # show all unacknowledged alerts
+python batchrunner.py list-alerts --job faces_full   # filter by job
+python batchrunner.py ack --job faces_full           # ack all alerts for a job
+python batchrunner.py ack --job faces_full --event stuck   # ack a specific event
+python batchrunner.py ack --all              # ack everything (use sparingly)
+```
+`ack` sets `acknowledged=true` on the Neo4j `:BatchJobAlert` node(s) AND clears
+`last_alert` in `batch_state.json` so the job can re-alert if the condition recurs.
+Acknowledging an alert does NOT resume a stuck/failed job — that still needs you to fix
+the root cause and clear the job's `status`/`failures` in `batch_state.json` (below).
+
 ## Diagnosing a stuck / failed job
 
 ```
