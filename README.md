@@ -48,8 +48,32 @@ where Neo4j Bolt (`100.64.43.123:7687`) is reachable.
 
 ## Status
 
-- [x] Checkpoint 1: `extract_metadata.py` — validated on 100-file 2025 sample
-      (100% dated, 71% GPS, 0 errors). Full scan pending.
-- [ ] `graph_write.py` — build + run (needs Neo4j Bolt driver on host).
-- [ ] `faces.py` — build.
-- [ ] `graph_faces.py` — build.
+- [x] **Checkpoint 1** (`77835fc`): `extract_metadata.py` — full scan of 41,246 files →
+      41,040 unique Media records. 100% dated, 55% GPS, 0 errors, spans 1929→2026.
+- [x] **Checkpoint 2** (`e59b88d`): `graph_write.py` — 41,040 `(Media)` nodes +
+      12,660 `LOCATED_AT` (EXIF GPS→SummaryPlace) + 1,955 `CAPTURED_AT_TIME`
+      (PhoneLog time-fallback). **Photos graph-searchable by TIME + LOCATION.**
+- [x] **Checkpoint 3** (`2495b65`): `faces.py` (insightface detect+embed+cluster, LOCAL,
+      no cloud) + `graph_faces.py` (`(FaceCluster)`/`(Person)`/`DEPICTS`/`IDENTIFIES`).
+      Validated on 50-img sample (45 faces / 33 clusters). **Person half graph-ready.**
+
+### What works now (query examples)
+```cypher
+// photos at "home" (South End) in 2025
+MATCH (m:Media)-[:LOCATED_AT|:CAPTURED_AT_TIME]->(sp:SummaryPlace {place_role:'home'})
+WHERE m.timestamp STARTS WITH '2025' RETURN m.path, m.timestamp
+
+// after Scott labels a cluster: photos of Lexi
+MATCH (p:Person {name:'Lexi'})<-[:IDENTIFIES]-(fc:FaceCluster)<-[:DEPICTS]-(m:Media)
+RETURN m.path, m.timestamp
+```
+
+### Remaining (not blockers, documented)
+- **Full face run**: `faces.py` on all 41k images is a multi-hour CPU job (insightface on
+  CPU). Sample validated; trigger the full run when convenient (resumable via faces.done).
+- **Cluster refinement**: greedy 0.5 threshold over-splits (33 clusters/45 faces on sample).
+  Improve with two-pass centroid matching or HDBSCAN.
+- **Human-in-loop labeling**: Scott renames `(Person {name:'Unknown N'})` → real name.
+  One-time per cluster; downstream queries resolve automatically.
+- **Video EXIF**: mov/mp4 get filename timestamps + null GPS (ffprobe not yet used).
+- **SummaryPlace.name is NULL** on all nodes (geo pipeline gap) — join by coords, not name.
