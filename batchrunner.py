@@ -221,7 +221,12 @@ def main():
         print(f"[batchrunner] FORCE {args.force} execute={args.execute}", flush=True)
         if not args.execute and not args.dry_run:
             print("[batchrunner] --force without --execute is a dry-run", flush=True)
-        run_slice(m, dry=not args.execute)
+        result = run_slice(m, dry=not args.execute)
+        # preview post_slice so --force --dry-run is honest about what follows a slice
+        if m.get("post_slice"):
+            print(f"[batchrunner] POST_SLICE {m['name']}: {m['post_slice'][:160]}", flush=True)
+            if args.dry_run:
+                print("[batchrunner] dry-run: post_slice not executed", flush=True)
         return
 
     # dispatch ALL runnable jobs (one action each per tick). Services (background
@@ -250,13 +255,51 @@ def main():
         finally:
             if m.get("type", "slice") == "slice" and os.path.exists(pidfile):
                 os.remove(pidfile)
-        # update state (slices count; services just record last launch)
+
+        # post_slice hook: e.g. copy embeddings out + graph-write so progress is
+        # queryable incrementally. Runs after a real (non-dry) slice.
+        if (result not in ("dry",) and m.get("post_slice") and m.get("type","slice")=="slice"):
+            ps = m["post_slice"]
+            print(f"[batchrunner] POST_SLICE {m['name']}: {ps[:160]}", flush=True)
+            if args.dry_run:
+                print("[batchrunner] dry-run: post_slice not executed", flush=True)
+            else:
+                try:
+                    r = subprocess.run(ps, shell=True, capture_output=True, text=True,
+                                        timeout=m.get("post_slice_timeout_sec", 600))
+                    print(f"[batchrunner] post_slice exit={r.returncode} "
+                          f"{(r.stdout+r.stderr)[-800:]}", flush=True)
+                except subprocess.TimeoutExpired:
+                    print("[batchrunner] post_slice timed out", file=sys.stderr, flush=True)
+
+        # update state
         prog = st.get(m["name"], {})
         if m.get("type", "slice") == "slice":
             prog["slices"] = prog.get("slices", 0) + (0 if result == "dry" else 1)
         prog["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
         prog["last_result"] = result
-        prog["status"] = "complete" if result == "complete" else "running"
+
+        # completion heuristic for slice jobs:
+        #   if manifest declares done_file + complete_when=done_file_stable,
+        #   compare done-file line count across ticks. Stable (no growth) after
+        #   >=1 run => the resumable job has drained => mark complete.
+        done_file = m.get("done_file")
+        if m.get("type", "slice") == "slice" and done_file and \
+                m.get("complete_when") == "done_file_stable":
+            try:
+                cur = sum(1 for _ in open(done_file)) if os.path.exists(done_file) else 0
+            except Exception:
+                cur = prog.get("done_lines", 0)
+            prev = prog.get("done_lines")
+            prog["done_lines"] = cur
+            if prev is not None and prev == cur and prog.get("slices", 0) >= 1:
+                prog["status"] = "complete"
+                print(f"[batchrunner] {m['name']} COMPLETE "
+                      f"(done_file stable at {cur} lines)", flush=True)
+            else:
+                prog["status"] = "running"
+        else:
+            prog["status"] = "complete" if result == "complete" else "running"
         st[m["name"]] = prog
     save_state(st)
     print(f"[batchrunner] dispatched {len(runnable)} job(s). state saved.", flush=True)

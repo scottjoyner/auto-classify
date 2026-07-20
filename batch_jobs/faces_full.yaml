@@ -30,12 +30,19 @@ slice_size: 200
 slice_timeout_sec: 1800
 idle_max_load: 2.0
 allowed_hours: "0-7,19-23"
-# after a slice, copy embeddings out + graph-write so progress is queryable incrementally
+# after a slice, copy embeddings + done-file out + graph-write so progress is
+# queryable incrementally. (faces.done copy lets the host-side completion
+# heuristic read line count without exec-ing into the container each tick.)
 post_slice: >-
   docker cp nextcloud:/var/www/html/data/admin/files/Photos/_ingest/face_embeddings.jsonl
   /media/scott/SSD_4TB/auto-classify/face_embeddings.jsonl &&
   docker cp nextcloud:/var/www/html/data/admin/files/Photos/_ingest/face_clusters.jsonl
   /media/scott/SSD_4TB/auto-classify/face_clusters.jsonl &&
+  docker cp nextcloud:/var/www/html/data/admin/files/Photos/_ingest/faces.done
+  /media/scott/SSD_4TB/auto-classify/faces.done &&
   /media/scott/SSD_4TB/auto-classify/venv/bin/python
   /media/scott/SSD_4TB/auto-classify/graph_faces.py
-complete_when: "faces.done stops growing (all media_ids present)"
+# completion: when the resumable faces.done stops growing between ticks, the
+# 41k-image job has drained -> mark complete automatically.
+done_file: /media/scott/SSD_4TB/auto-classify/faces.done
+complete_when: done_file_stable
