@@ -78,25 +78,46 @@ def can_run_now(m, st, other_running, dry=False):
     reasons = []
     if not m.get("enabled", False):
         return False, "disabled"
+    mtype = m.get("type", "slice")
     # allowed hours
     ah = m.get("allowed_hours")  # e.g. "0-7,19-23" or None=any
     if ah:
         hr = datetime.datetime.now().hour
-        ok_hour = any(
-            int(a) <= hr <= int(b) for part in ah.split(",") for a, b in [part.split("-")]
-        ) if "-" in ah else hr in [int(x) for x in ah.split(",")]
+        if "-" in ah:
+            ok_hour = any(
+                int(a) <= hr <= int(b) for part in ah.split(",") for a, b in [part.split("-")]
+            )
+        else:
+            ok_hour = hr in [int(x) for x in ah.split(",")]
         if not ok_hour:
             return False, f"outside allowed_hours ({ah})"
-    # idle gate
-    max_load = m.get("idle_max_load", 2.0)
-    load = host_load_avg1()
-    ncpu = host_cpu_count()
-    load_pct = load / ncpu
-    if load_pct > max_load:
-        return False, f"host busy (load {load:.1f}/{ncpu}c = {load_pct:.0%} > {max_load:.0%})"
-    # no other batch currently running
-    if other_running:
-        return False, f"another batch running ({other_running})"
+    # idle gate (slice jobs): host load
+    if mtype == "slice":
+        max_load = m.get("idle_max_load", 2.0)
+        load = host_load_avg1()
+        ncpu = host_cpu_count()
+        load_pct = load / ncpu
+        if load_pct > max_load:
+            return False, f"host busy (load {load:.1f}/{ncpu}c = {load_pct:.0%} > {max_load:.0%})"
+        if other_running:
+            return False, f"another batch running ({other_running})"
+    # service jobs: launch only if not already running
+    elif mtype == "service":
+        pidf = m.get("pidfile")
+        if pidf and os.path.exists(pidf):
+            try:
+                with open(pidf) as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, 0)
+                return False, f"already running (pid {pid})"
+            except Exception:
+                os.remove(pidf)
+        # also idle-gate services so they don't spin up on a hot host
+        max_load = m.get("idle_max_load", 1.5)
+        load = host_load_avg1()
+        ncpu = host_cpu_count()
+        if load / ncpu > max_load:
+            return False, f"host busy (load {load:.1f}/{ncpu}c)"
     # completion check
     prog = st.get(m["name"], {})
     if prog.get("status") == "complete":
@@ -104,11 +125,32 @@ def can_run_now(m, st, other_running, dry=False):
     return True, "ok"
 
 def run_slice(m, dry=False):
-    """Execute one slice of the manifest command. Resumable via manifest's own done-file."""
+    """Execute one slice (type=slice) or launch/verify a service (type=service)."""
+    mtype = m.get("type", "slice")
     cmd = m["command"]
-    slice_arg = m.get("slice_arg", "--limit")   # how the command takes a slice size
+
+    if mtype == "service":
+        # launch in background, write pidfile
+        pidf = m.get("pidfile")
+        nohup = m.get("nohup", True)
+        full = f"nohup {cmd} > {m.get('logfile', '/dev/null')} 2>&1 & echo $!" if nohup else cmd
+        print(f"[batchrunner] SERVICE {m['name']}: {full}", flush=True)
+        if dry:
+            print("[batchrunner] dry-run: not launching", flush=True)
+            return "dry"
+        if pidf:
+            # launch and capture pid
+            r = subprocess.run(f"{cmd} & echo $! > {pidf}", shell=True,
+                                capture_output=True, text=True)
+            print(f"[batchrunner] launched, pidfile={pidf}: {r.stdout.strip()[-200:]}", flush=True)
+        else:
+            subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        return "ok"
+
+    # slice type
+    slice_arg = m.get("slice_arg", "--limit")
     slice_size = m.get("slice_size", 200)
-    # build the actual command: append slice flag + size
     full = cmd
     if slice_arg and slice_size:
         full = f"{cmd} {slice_arg} {slice_size}"
@@ -116,7 +158,6 @@ def run_slice(m, dry=False):
     if dry:
         print("[batchrunner] dry-run: not executing", flush=True)
         return "dry"
-    # run with a timeout so one slice can't hang the dispatcher
     timeout = m.get("slice_timeout_sec", 1800)
     try:
         r = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=timeout)
@@ -143,14 +184,15 @@ def main():
         print("[batchrunner] no manifests"); sys.exit(0)
     st = load_state()
 
-    # detect "another batch running" via a pidfile
+    # detect "another SLICE batch running" via pidfile (services don't block slices;
+    # they're independent background workers).
     pidfile = os.path.join(HERE, "batchrunner.pid")
     other = None
     if os.path.exists(pidfile):
         try:
             with open(pidfile) as f:
                 pid = int(f.read().strip())
-            os.kill(pid, 0)  # raises if not running
+            os.kill(pid, 0)
             other = f"pid {pid}"
         except Exception:
             os.remove(pidfile)
@@ -158,7 +200,7 @@ def main():
     # evaluate each manifest
     evaluated = []
     for m in manifests:
-        ok, reason = can_run_now(m, st, other)
+        ok, reason = can_run_now(m, st, other if m.get("type", "slice") == "slice" else None)
         evaluated.append((m, ok, reason))
 
     print("=== batchrunner dispatch ===", flush=True)
@@ -182,41 +224,42 @@ def main():
         run_slice(m, dry=not args.execute)
         return
 
-    # pick highest-priority runnable
+    # dispatch ALL runnable jobs (one action each per tick). Services (background
+    # workers) and slices (one-shot) are independent — run each that's gated-open.
     runnable = [(m, ok, r) for m, ok, r in evaluated if ok]
     if not runnable:
         print("[batchrunner] nothing runnable now (all gated).", flush=True)
         return
 
-    # sort by priority rank asc (0 first)
-    runnable.sort(key=lambda x: PRIORITY_RANK.get(x[0].get("priority","batch"), 5))
-    m = runnable[0][0]
-    print(f"[batchrunner] -> dispatching {m['name']} (priority {m.get('priority')})", flush=True)
+    # order: services first (cheap to launch), then slices by priority rank asc
+    def sort_key(x):
+        m = x[0]
+        is_svc = m.get("type", "slice") == "service"
+        return (0 if is_svc else 1, PRIORITY_RANK.get(m.get("priority", "batch"), 5))
+    runnable.sort(key=sort_key)
 
-    # claim pidfile
-    with open(pidfile, "w") as f:
-        f.write(str(os.getpid()))
-    try:
-        result = run_slice(m, dry=args.dry_run)
-    finally:
-        if os.path.exists(pidfile):
-            os.remove(pidfile)
-
-    # update state
-    prog = st.get(m["name"], {})
-    prog["slices"] = prog.get("slices", 0) + (0 if result == "dry" else 1)
-    prog["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
-    prog["last_result"] = result
-    # completion heuristic: manifest may declare total_slices; else mark complete after
-    # a slice returns no new work (caller-specific). For faces, done-file drives it.
-    if m.get("complete_when"):
-        # e.g. "faces.done exists and stable" — checked by the job itself; here we just
-        # mark complete if the manifest says autodetect and the command reports done.
-        pass
-    prog["status"] = "complete" if result == "complete" else "running"
-    st[m["name"]] = prog
+    for m, ok, reason in runnable:
+        print(f"[batchrunner] -> {m['name']} (type={m.get('type','slice')}, "
+              f"priority {m.get('priority')})", flush=True)
+        # claim pidfile only for slice jobs (services are background, don't hold the lock)
+        if m.get("type", "slice") == "slice":
+            with open(pidfile, "w") as f:
+                f.write(str(os.getpid()))
+        try:
+            result = run_slice(m, dry=args.dry_run)
+        finally:
+            if m.get("type", "slice") == "slice" and os.path.exists(pidfile):
+                os.remove(pidfile)
+        # update state (slices count; services just record last launch)
+        prog = st.get(m["name"], {})
+        if m.get("type", "slice") == "slice":
+            prog["slices"] = prog.get("slices", 0) + (0 if result == "dry" else 1)
+        prog["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
+        prog["last_result"] = result
+        prog["status"] = "complete" if result == "complete" else "running"
+        st[m["name"]] = prog
     save_state(st)
-    print(f"[batchrunner] done. state saved.", flush=True)
+    print(f"[batchrunner] dispatched {len(runnable)} job(s). state saved.", flush=True)
 
 if __name__ == "__main__":
     main()

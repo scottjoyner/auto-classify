@@ -70,10 +70,41 @@ RETURN m.path, m.timestamp
 
 ### Remaining (not blockers, documented)
 - **Full face run**: `faces.py` on all 41k images is a multi-hour CPU job (insightface on
-  CPU). Sample validated; trigger the full run when convenient (resumable via faces.done).
+  CPU). Sample validated; trigger full run when convenient (resumable via `_ingest/faces.done`).
 - **Cluster refinement**: greedy 0.5 threshold over-splits (33 clusters/45 faces on sample).
   Improve with two-pass centroid matching or HDBSCAN.
 - **Human-in-loop labeling**: Scott renames `(Person {name:'Unknown N'})` → real name.
   One-time per cluster; downstream queries resolve automatically.
 - **Video EXIF**: mov/mp4 get filename timestamps + null GPS (ffprobe not yet used).
 - **SummaryPlace.name is NULL** on all nodes (geo pipeline gap) — join by coords, not name.
+
+## Batch-load scheduler (`batchrunner`)
+
+Long CPU jobs (the 41k face run) must NOT hammer the host or preempt fleet compute.
+`batchrunner.py` is a **priority-aware, idle-gated dispatcher** that drives any resumable
+batch command in safe slices.
+
+- **Manifest per job** (`batch_jobs/*.yaml`): `command`, `slice_size`, `priority`,
+  `idle_max_load`, `allowed_hours`, `slice_timeout_sec`, optional `post_slice`.
+- **Priority** aligns with the AssistX task enum: `critical=0 … batch=5`. Lower = sooner.
+  The face run is `priority: batch` (5) — lowest, runs only when idle.
+- **Idle gate**: 1-min host load < `idle_max_load` per CPU AND current hour ∈ `allowed_hours`.
+- **Slice execution**: one slice per dispatch tick (e.g. `faces.py --limit 200`), resumable
+  via the command's own done-file. Progress in `batch_state.json`.
+- **`--dry-run`**: prints the decision tree, executes nothing (prep/validate without load).
+- **Cron** `batchrunner-dispatch` (every 15 min) calls `batchrunner_dispatch.sh`.
+  The `faces_full.yaml` manifest is `enabled: false` → dispatcher correctly reports
+  "nothing runnable now". Flip `enabled: true` + it self-starts when host is idle.
+
+```
+# prep/preview — no execution:
+python batchrunner.py dispatch --dry-run
+python batchrunner.py --force faces_full --dry-run
+python batchrunner.py status
+# to actually start the face load:
+#   1. edit batch_jobs/faces_full.yaml: enabled: true
+#   2. cron fires every 15m, runs one 200-img slice when idle
+```
+
+This is generic: any resumable batch command (re-index, backfill, embed) drops in as a
+new manifest with a priority — the dispatcher orders and gates them all.

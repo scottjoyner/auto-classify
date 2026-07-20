@@ -1,0 +1,33 @@
+# Batch load manifest: auto-ingest idle worker (the PERSONAL RECALL pipeline).
+#
+# This is the OTHER big batch load Scott flagged. It is a mature, ALREADY
+# idle-gated, resumable 4-stage worker (run_worker.sh): speaker-link → dashcam
+# compress → content-gen → Nextcloud ingest. Each stage is resumable via its own
+# state file. It was PAUSED (cron e6dfa93319c5) after erroring 2026-06-10
+# (CPU hammering + a missing-file bug since fixed via shim).
+#
+# Rather than re-orchestrate its stages, batchrunner treats it as a SERVICE:
+# launch the idle worker when the host is idle + not already running; otherwise skip.
+# The worker's OWN idle gate (loadavg < 0.6*nproc) protects the host further.
+# This gives one control surface for "is the ingest worker alive?" without two
+# idle gates fighting.
+#
+# Driven by: auto-classify/batchrunner.py
+# Priority 4 = BACKGROUND (above the face BATCH=5, so if both are gated-open
+#   the ingest service launches first, then face slices run).
+# Idle gate: 1-min load < 1.5 per CPU (lighter than slices; service just launches).
+
+name: auto_ingest
+enabled: false          # flip to true to let batchrunner keep the worker alive
+priority: background     # 4 (above batch=5, below interactive)
+type: service          # launch-if-not-running, don't drive slices
+command: >-
+  cd /home/scott/git/auto-ingest &&
+  export NEO4J_URI=bolt://100.64.43.123:7687 NEO4J_USER=neo4j &&
+  export NEO4J_PASSWORD="$(python3 -c 'from auto_ingest_config import get_neo4j_password; print(get_neo4j_password())' 2>/dev/null || echo knowledge_graph_2026)" &&
+  ./run_worker.sh
+pidfile: /home/scott/git/auto-ingest/worker.pid
+logfile: /home/scott/git/auto-ingest/logs/batchrunner_worker.log
+idle_max_load: 1.5
+# no allowed_hours: ingest worker self-limits via its own idle gate; if host is
+# hot it just sleeps. Keep it alive whenever the host has any idle headroom.
