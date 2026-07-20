@@ -31,7 +31,7 @@
 #   a safe chunk. To actually start the face load: set the manifest enabled=true and
 #   unpause the cron.
 
-import os, sys, json, time, subprocess, argparse, datetime
+import os, sys, json, time, subprocess, argparse, datetime, shlex
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BATCH_DIR = os.path.join(HERE, "batch_jobs")
@@ -39,6 +39,61 @@ STATE_FILE = os.path.join(HERE, "batch_state.json")
 
 # priority name -> rank (0 highest)
 PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "background": 4, "batch": 5}
+
+# ---------------------------------------------------------------------------
+# ALERTING — a job going STUCK or hitting max_failures is a CRITICAL gap if it
+# stays silent. Fire to 3 reachable (no browser-approval) channels:
+#   1. Neo4j  (:BatchJobAlert node)  — persistent, any-agent/Sophia-readable
+#   2. alerts.log (local)            — always works
+#   3. Nextcloud note (docker exec)  — Scott sees it on his phone
+# Each channel is wrapped so one failing never breaks the dispatcher.
+# (Signal is intentionally NOT used: outbound Signal lives on x1-370 and SSH to
+#  it is Tailscale-SSH which needs browser approval headless — unreliable here.)
+# ---------------------------------------------------------------------------
+ALERTS_LOG = os.path.join(HERE, "alerts.log")
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://100.64.43.123:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "knowledge_graph_2026")
+NEXTCLOUD_NOTE = "/var/www/html/data/admin/files/HermesAlerts/batch_jobs.md"
+
+def alert(job, event, message, severity="warn"):
+    """Fire an alert to all reachable channels. event e.g. 'stuck'|'max_failures'."""
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    line = f"{ts} [{severity.upper()}] {job}:{event} {message}"
+    print(f"[batchrunner] ALERT {line}", file=sys.stderr, flush=True)
+    # 1) local log (always)
+    try:
+        with open(ALERTS_LOG, "a") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"[batchrunner] alert: log failed: {e}", file=sys.stderr, flush=True)
+    # 2) Neo4j node (MERGE by job+event+date so re-runs don't spam duplicates)
+    try:
+        from neo4j import GraphDatabase
+        key = f"{job}:{event}:{ts[:10]}"
+        d = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+        with d.session() as s:
+            s.run(
+                "MERGE (a:BatchJobAlert {key:$key}) "
+                "SET a.job=$job, a.event=$event, a.severity=$sev, a.message=$msg, "
+                "a.ts=$ts, a.acknowledged=false",
+                key=key, job=job, event=event, sev=severity, msg=message, ts=ts)
+        d.close()
+    except Exception as e:
+        print(f"[batchrunner] alert: neo4j failed: {e}", file=sys.stderr, flush=True)
+    # 3) Nextcloud note (append under a daily heading)
+    try:
+        note = f"\n## {ts} — {severity.upper()} {job}:{event}\n\n{message}\n\n" \
+               "---\n"
+        mkcmd = (f"mkdir -p /var/www/html/data/admin/files/HermesAlerts && "
+                 f"touch {NEXTCLOUD_NOTE}")
+        docker_exec = f"docker exec nextcloud sh -c {shlex.quote(mkcmd)}"
+        subprocess.run(docker_exec, shell=True, capture_output=True, timeout=30)
+        append = f"printf %s {shlex.quote(note)} >> {NEXTCLOUD_NOTE}"
+        docker_exec2 = f"docker exec nextcloud sh -c {shlex.quote(append)}"
+        subprocess.run(docker_exec2, shell=True, capture_output=True, timeout=30)
+    except Exception as e:
+        print(f"[batchrunner] alert: nextcloud failed: {e}", file=sys.stderr, flush=True)
 
 def load_manifests():
     import glob, yaml
@@ -305,10 +360,21 @@ def main():
                 prog["last_error"] = datetime.datetime.now().isoformat(timespec="seconds")
                 print(f"[batchrunner] {m['name']} FAIL ({result}); "
                       f"consecutive failures={prog['failures']}", flush=True)
+                max_fail = m.get("max_failures", 0)
+                # alert once when we first hit the cap (don't spam every tick after)
+                if max_fail and prog["failures"] >= max_fail and \
+                        prog.get("last_alert") != "max_failures":
+                    alert(m["name"], "max_failures",
+                          f"Job hit {prog['failures']} consecutive failures "
+                          f"(last: {result}). Skipped until failures cleared in "
+                          f"batch_state.json or --force --execute. Inspect the job.",
+                          severity="critical")
+                    prog["last_alert"] = "max_failures"
             else:
                 if prog.get("failures", 0):
                     print(f"[batchrunner] {m['name']} recovered; failures reset", flush=True)
                 prog["failures"] = 0
+                prog.pop("last_alert", None)  # recovered -> re-arm alert for next incident
 
         # completion heuristic for slice jobs:
         #   if manifest declares done_file + complete_when=done_file_stable,
@@ -339,11 +405,22 @@ def main():
                 stuck_limit = m.get("stuck_ticks", 0)
                 if stuck_limit and prog["stuck_ticks"] >= stuck_limit and \
                         prog.get("failures", 0) == 0:
+                    if prog.get("status") != "stuck":
+                        alert(m["name"], "stuck",
+                              f"Job is RUNNING but its done_file has not advanced for "
+                              f"{prog['stuck_ticks']} ticks (~{stuck_limit*15//60}h) with "
+                              f"no error. Progress preserved. Diagnose why the done-file "
+                              f"isn't growing, then clear status:running in batch_state.json "
+                              f"to resume.", severity="critical")
+                        prog["last_alert"] = "stuck"
                     prog["status"] = "stuck"
                     print(f"[batchrunner] {m['name']} STUCK "
                           f"(done_file flat {prog['stuck_ticks']} ticks; needs attention)",
                           flush=True)
                 else:
+                    if prog.get("status") == "stuck":
+                        # un-stuck (done_file moved / tick reset) -> re-arm alert
+                        prog.pop("last_alert", None)
                     prog["status"] = "running"
         else:
             if result == "complete":
