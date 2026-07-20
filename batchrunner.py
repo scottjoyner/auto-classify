@@ -118,10 +118,28 @@ def can_run_now(m, st, other_running, dry=False):
         ncpu = host_cpu_count()
         if load / ncpu > max_load:
             return False, f"host busy (load {load:.1f}/{ncpu}c)"
-    # completion check
+    # completion / terminal-state checks
     prog = st.get(m["name"], {})
     if prog.get("status") == "complete":
         return False, "already complete"
+    if prog.get("status") == "stuck":
+        return False, "stuck (needs attention — done_file not growing; clear status to resume)"
+    # backoff: after consecutive failures, wait exponentially before retrying so a
+    # broken job doesn't hammer the host every tick. max_failures==0 disables the cap.
+    max_fail = m.get("max_failures", 0)
+    fails = prog.get("failures", 0)
+    if max_fail and fails >= max_fail:
+        return False, f"max_failures reached ({fails}; inspect job, clear failures to retry)"
+    if fails > 0:
+        last = prog.get("last_run")
+        if last:
+            try:
+                last_dt = datetime.datetime.fromisoformat(last)
+                cooldown = min(fails, 5) * m.get("backoff_min", 30)  # 30,60,90,120,150...
+                if (datetime.datetime.now() - last_dt).total_seconds() < cooldown * 60:
+                    return False, f"backoff (fail {fails}, next retry in {(cooldown*60 - (datetime.datetime.now()-last_dt).total_seconds())/60:.0f}m)"
+            except Exception:
+                pass
     return True, "ok"
 
 def run_slice(m, dry=False):
@@ -279,6 +297,19 @@ def main():
         prog["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
         prog["last_result"] = result
 
+        # failure accounting (slice jobs only): error/timeout increments consecutive
+        # failures; any success resets. Drives the backoff gate in can_run_now.
+        if m.get("type", "slice") == "slice" and result not in ("dry",):
+            if result in ("error", "timeout"):
+                prog["failures"] = prog.get("failures", 0) + 1
+                prog["last_error"] = datetime.datetime.now().isoformat(timespec="seconds")
+                print(f"[batchrunner] {m['name']} FAIL ({result}); "
+                      f"consecutive failures={prog['failures']}", flush=True)
+            else:
+                if prog.get("failures", 0):
+                    print(f"[batchrunner] {m['name']} recovered; failures reset", flush=True)
+                prog["failures"] = 0
+
         # completion heuristic for slice jobs:
         #   if manifest declares done_file + complete_when=done_file_stable,
         #   compare done-file line count across ticks. Stable (no growth) after
@@ -294,12 +325,33 @@ def main():
             prog["done_lines"] = cur
             if prev is not None and prev == cur and prog.get("slices", 0) >= 1:
                 prog["status"] = "complete"
+                prog["failures"] = 0
                 print(f"[batchrunner] {m['name']} COMPLETE "
                       f"(done_file stable at {cur} lines)", flush=True)
             else:
-                prog["status"] = "running"
+                # stuck detection: running but done_file hasn't grown for
+                # stuck_ticks consecutive ticks (and no error counted) -> flag,
+                # don't delete progress. Needs human/agent attention to resume.
+                if prev is not None and prev == cur:
+                    prog["stuck_ticks"] = prog.get("stuck_ticks", 0) + 1
+                else:
+                    prog["stuck_ticks"] = 0
+                stuck_limit = m.get("stuck_ticks", 0)
+                if stuck_limit and prog["stuck_ticks"] >= stuck_limit and \
+                        prog.get("failures", 0) == 0:
+                    prog["status"] = "stuck"
+                    print(f"[batchrunner] {m['name']} STUCK "
+                          f"(done_file flat {prog['stuck_ticks']} ticks; needs attention)",
+                          flush=True)
+                else:
+                    prog["status"] = "running"
         else:
-            prog["status"] = "complete" if result == "complete" else "running"
+            if result == "complete":
+                prog["status"] = "complete"
+            elif result in ("error", "timeout"):
+                prog["status"] = "running"  # failures gate handles backoff
+            else:
+                prog["status"] = "running"
         st[m["name"]] = prog
     save_state(st)
     print(f"[batchrunner] dispatched {len(runnable)} job(s). state saved.", flush=True)

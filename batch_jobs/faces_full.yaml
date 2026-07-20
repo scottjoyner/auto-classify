@@ -30,6 +30,10 @@ slice_size: 200
 slice_timeout_sec: 1800
 idle_max_load: 2.0
 allowed_hours: "0-7,19-23"
+# resilience: don't hammer a broken job; flag if it's running but not progressing
+max_failures: 3        # give up + flag after 3 consecutive slice failures
+backoff_min: 30        # exponential cooldown between retries (30,60,90,...min)
+stuck_ticks: 8         # if done_file flat for 8 ticks (~2h) with no error -> STUCK
 # after a slice, copy embeddings + done-file out + graph-write so progress is
 # queryable incrementally. (faces.done copy lets the host-side completion
 # heuristic read line count without exec-ing into the container each tick.)
