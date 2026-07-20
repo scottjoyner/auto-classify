@@ -108,3 +108,20 @@ python batchrunner.py status
 
 This is generic: any resumable batch command (re-index, backfill, embed) drops in as a
 new manifest with a priority — the dispatcher orders and gates them all.
+
+### Two job types
+
+- **`type: slice`** (e.g. `faces_full`): one-shot, resumable command driven in
+  chunks (`faces.py --limit 200`). The comand's own done-file makes re-runs safe.
+  Gated by host idle load + allowed_hours. Priority `batch` (5) = lowest.
+- **`type: service`** (e.g. `auto_ingest`): a long-lived background worker that is
+  ALREADY idle-gated + resumable on its own (`run_worker.sh`, 4-stage: speaker-link
+  → dashcam-compress → content-gen → Nextcloud ingest). batchrunner only LAUNCHES it
+  when the host is idle AND it isn't already running; otherwise skips. One control
+  surface for "is ingest alive?" without two idle-gates fighting. Priority
+  `background` (4) — launches before face slices if both are gated-open.
+
+The auto-ingest cron (`e6dfa93319c5`) was PAUSED 2026-06-10 (CPU hammering +
+a since-fixed missing-file bug). Rather than re-orchestrate its stages, batchrunner
+keeps the idle worker alive as a managed service. Flip `auto_ingest.yaml: enabled: true`
+to let the dispatcher relaunch it on idle hosts.
