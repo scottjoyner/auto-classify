@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """
-extract_metadata.py — scan Nextcloud Photos/, extract EXIF metadata, write JSONL.
+extract_metadata.py — scan Photos/, extract EXIF metadata, write JSONL.
 
-RUN INSIDE the nextcloud container (it's the only place that can read the photo
-volume). Reads config.PHOTOS_ROOT_IN_CONTAINER, writes JSONL to
-config.INGEST_DIR_IN_CONTAINER/media_inventory.jsonl.
+Supports two modes:
+  1. Container mode (default): reads from nextcloud container path
+  2. Host mode (--photos-root): reads directly from host filesystem
 
 Idempotent: tracks processed sha256 in a sidecar .done set; re-running skips them.
 Resume-safe across crashes.
 
 Usage:
+  # Container mode:
   docker exec nextcloud /tmp/facevenv/bin/python /work/extract_metadata.py [--year 2025] [--limit 100]
+
+  # Host mode:
+  python extract_metadata.py --photos-root /media/scott/SSD_4TB/nextcloud_stage [--limit 100]
 """
 import os, sys, json, hashlib, glob, argparse, traceback
-sys.path.insert(0, "/work")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ac_config import (PHOTOS_ROOT_IN_CONTAINER, INGEST_DIR_IN_CONTAINER,
                     IMAGE_EXTS, VIDEO_EXTS, ALL_EXTS)
 
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
-
-OUT_DIR = INGEST_DIR_IN_CONTAINER
-OUT_FILE = os.path.join(OUT_DIR, "media_inventory.jsonl")
-DONE_FILE = os.path.join(OUT_DIR, "media_inventory.done")
 
 def sha256(path, chunk=1 << 20):
     h = hashlib.sha256()
@@ -113,16 +114,29 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--year", help="only this year dir")
     ap.add_argument("--limit", type=int, help="max files (for testing)")
+    ap.add_argument("--photos-root", help="Host photos root (enables host mode)")
+    ap.add_argument("--output-dir", help="Directory for JSONL output (default: _ingest under photos-root)")
     args = ap.parse_args()
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # Determine paths based on mode
+    if args.photos_root:
+        photos_root = args.photos_root
+        out_dir = args.output_dir or os.path.join(photos_root, "_ingest")
+    else:
+        photos_root = PHOTOS_ROOT_IN_CONTAINER
+        out_dir = INGEST_DIR_IN_CONTAINER
+
+    out_file = os.path.join(out_dir, "media_inventory.jsonl")
+    done_file = os.path.join(out_dir, "media_inventory.done")
+
+    os.makedirs(out_dir, exist_ok=True)
     done = set()
-    if os.path.exists(DONE_FILE):
-        with open(DONE_FILE) as f:
+    if os.path.exists(done_file):
+        with open(done_file) as f:
             done = set(l.strip() for l in f if l.strip())
 
     # gather files
-    root = PHOTOS_ROOT_IN_CONTAINER
+    root = photos_root
     pattern = os.path.join(root, args.year, "**", "*") if args.year else os.path.join(root, "**", "*")
     files = [p for p in glob.glob(pattern, recursive=True)
              if os.path.isfile(p) and os.path.splitext(p)[1].lower() in ALL_EXTS
@@ -132,7 +146,7 @@ def main():
     print(f"[extract] {len(files)} files to process (year={args.year or 'ALL'})", flush=True)
 
     n = 0
-    with open(OUT_FILE, "a") as out, open(DONE_FILE, "a") as donef:
+    with open(out_file, "a") as out, open(done_file, "a") as donef:
         for i, p in enumerate(files, 1):
             try:
                 rec = process(p)
@@ -143,7 +157,7 @@ def main():
                 print(f"[extract] ERR {p}: {e}", file=sys.stderr, flush=True)
             if i % 200 == 0:
                 print(f"[extract] {i}/{len(files)} processed", flush=True)
-    print(f"[extract] DONE: wrote {n} records to {OUT_FILE}", flush=True)
+    print(f"[extract] DONE: wrote {n} records to {out_file}", flush=True)
 
 if __name__ == "__main__":
     main()

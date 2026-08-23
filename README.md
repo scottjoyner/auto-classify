@@ -1,142 +1,191 @@
 # auto-classify
 
-Ingest Scott's Nextcloud photo/video archive into Neo4j so media becomes
-graph-searchable by **time**, **location**, and **person**.
+Ingest photo/video archives into Neo4j so media becomes graph-searchable by
+**time**, **location**, and **person**. Designed for the Nextcloud `Photos/`
+iOS instant-upload feed (~117GB, ~41k files, 2007–2026).
 
 ## What it does
 
-Nextcloud `Photos/` (117 GB, ~41k files, `YYYY/MM` layout, 2007→2025) is the iOS
-instant-upload feed. This pipeline turns those files into first-class `(Media)` nodes
-in Neo4j, linked to:
+```
+Photos/ ──► extract_metadata.py ──► media_inventory.jsonl ──► graph_write.py ──► Neo4j (Media + Location)
+                  │
+                  ▼
+              faces.py ──► face_embeddings.jsonl ──► graph_faces.py ──► Neo4j (Person + DEPICTS)
+                           face_clusters.jsonl
+```
 
-- **time** — EXIF `DateTimeOriginal` (92% coverage) or filename parse for videos
-- **location** — EXIF GPS (86% coverage) joined by coordinate proximity to the
-  existing `SummaryPlace` nodes (reuses the `neo4j-summary-geo-clustering` topology);
-  photos without GPS fall back to contemporaneous PhoneLog GPS (±2h)
-- **person** — `insightface` (local, onnxruntime, no cloud) detects + embeds faces,
-  clusters them; Scott labels a cluster once → `(Person)` node
+- **Time**: EXIF `DateTimeOriginal` (92% coverage) or filename parse for videos
+- **Location**: EXIF GPS (86% coverage) joined by haversine to `SummaryPlace` nodes (≤50km)
+- **Person**: `insightface` local face detect → 512-d embedding → greedy cluster → you label
 
 Then: *"photos of Lexi at the beach in June 2025"* is a one-hop Cypher query.
 
-## Stages (each is a git checkpoint)
+## Hardware
 
-| Script | Runs | Purpose |
-|--------|------|---------|
-| `extract_metadata.py` | inside nextcloud container | walk Photos/, EXIF → `media_inventory.jsonl` |
-| `graph_write.py` | host (x1-370) | `MERGE (Media)` + GPS→`SummaryPlace` join + time fallback |
-| `faces.py` | inside nextcloud container | insightface detect/embed/cluster → `face_clusters.jsonl` |
-| `graph_faces.py` | host (x1-370) | `MERGE (Person)`/`(FaceCluster)` + `DEPICTS` edges |
+| Component | Spec |
+|-----------|------|
+| CPU | AMD Ryzen AI Max Pro 390 (24 threads) |
+| NPU | XDNA NPU via VitisAI Execution Provider |
+| RAM | 24GB |
+| Storage | `/media/scott/SSD_4TB/` (NVMe) |
+| Photos | `/media/scott/SSD_4TB/nextcloud_stage/` |
 
-## Why run extraction inside the container
+## Quick start
 
-The Nextcloud data volume (`docker-compose_nextcloud-data`) is root-owned; only the
-nextcloud container (running as root) can read `/var/www/html/data/admin/files/Photos`.
-So `extract_metadata.py` / `faces.py` execute via
-`docker exec nextcloud /tmp/facevenv/bin/python /work/<script>.py` and write JSONL into
-the volume's `_ingest/` dir, retrieved with `docker cp`. Graph writes run on the host
-where Neo4j Bolt (`100.64.43.123:7687`) is reachable.
+```bash
+# 1. Generate media inventory
+python extract_metadata.py --photos-root /media/scott/SSD_4TB/nextcloud_stage
 
-## Environment notes (verified 2026-07-20)
+# 2. Write to Neo4j
+python graph_write.py --jsonl /media/scott/SSD_4TB/nextcloud_stage/_ingest/media_inventory.jsonl
 
-- Container python is 3.13 (Debian 13); build the venv **inside** the container
-  (`python3 -m venv /tmp/facevenv` + `pip install Pillow insightface onnxruntime
-  opencv-python-headless`). Host-built venvs don't load (glibc/binary mismatch).
-- `insightface` needs `opencv-python-headless` (not `opencv-python` — no libGL in slim).
-- EXIF: `DateTimeOriginal` is in the Exif **sub-IFD** (0x8769, tag 36867); GPS coords
-  are `IFDRational` → cast `float()`. Sign by N/S/E/W ref.
-- File types: 29453 jpg, 9470 png, 1386 mov, 980 mp4, 57 jpeg. No HEIC.
+# 3. Run face detection (NPU-accelerated)
+./run_faces_npu.sh --limit 200
 
-## Status
+# 4. Load faces into Neo4j
+python graph_faces.py \
+  --emb /media/scott/SSD_4TB/nextcloud_stage/_ingest/face_embeddings.jsonl \
+  --clusters /media/scott/SSD_4TB/nextcloud_stage/_ingest/face_clusters.jsonl
 
-- [x] **Checkpoint 1** (`77835fc`): `extract_metadata.py` — full scan of 41,246 files →
-      41,040 unique Media records. 100% dated, 55% GPS, 0 errors, spans 1929→2026.
-- [x] **Checkpoint 2** (`e59b88d`): `graph_write.py` — 41,040 `(Media)` nodes +
-      12,660 `LOCATED_AT` (EXIF GPS→SummaryPlace) + 1,955 `CAPTURED_AT_TIME`
-      (PhoneLog time-fallback). **Photos graph-searchable by TIME + LOCATION.**
-- [x] **Checkpoint 3** (`2495b65`): `faces.py` (insightface detect+embed+cluster, LOCAL,
-      no cloud) + `graph_faces.py` (`(FaceCluster)`/`(Person)`/`DEPICTS`/`IDENTIFIES`).
-      Validated on 50-img sample (45 faces / 33 clusters). **Person half graph-ready.**
+# 5. Label faces in the web UI
+python classify_ui.py
+# Open http://localhost:8080
+```
 
-### What works now (query examples)
+## Scripts
+
+| Script | Purpose | Runs on |
+|--------|---------|---------|
+| `extract_metadata.py` | Scan photos, extract EXIF → JSONL | Host or container |
+| `graph_write.py` | MERGE Media nodes + GPS→SummaryPlace join | Host (Neo4j) |
+| `faces.py` | insightface detect/embed/cluster | Host (NPU) or container |
+| `graph_faces.py` | MERGE FaceCluster/Person + DEPICTS edges | Host (Neo4j) |
+| `classify_ui.py` | Web UI for labeling face clusters | Host |
+| `batchrunner.py` | Idle-gated batch dispatcher | Host |
+| `run_faces_npu.sh` | NPU environment wrapper | Host |
+
+## Output files
+
+All written to `_ingest/` under the photos root:
+
+| File | Format | Description |
+|------|--------|-------------|
+| `media_inventory.jsonl` | `{path, media_id, ext, size, media_type, timestamp, width, height, gps_lat, gps_lon}` | One record per file |
+| `face_embeddings.jsonl` | `{media_id, face_idx, bbox, cluster_id, embedding[512]}` | One record per face detected |
+| `face_clusters.jsonl` | `{cluster_id, member_count}` | Cluster summary |
+| `faces.done` | media_id per line | Resumability checkpoint |
+
+## NPU acceleration
+
+Face detection runs on the Ryzen XDNA NPU via the VitisAI Execution Provider:
+
+- First run compiles the AIE firmware (~2-3 min, cached at `/tmp/scott/vaip/.cache/`)
+- Subsequent runs use the cached compiled model
+- If the VitisAI EP fails (e.g. model incompatibility), automatically falls back to CPU
+- The NPU probe runs in a subprocess to avoid C++ abort crashes
+
+```bash
+# The wrapper script sets all required env vars
+./run_faces_npu.sh --limit 200
+
+# Or set manually
+export RYZEN_AI_INSTALLATION_PATH=/media/scott/data/ryzen-ai-venv
+export LD_PRELOAD="/opt/xilinx/xrt/lib/libxrt_coreutil.so.2"
+export LD_LIBRARY_PATH=".../voe/lib:.../onnxruntime/lib:.../deployment/lib:/opt/xilinx/xrt/lib"
+```
+
+## Batch processing
+
+The `batchrunner.py` drives face detection in safe, resumable slices:
+
+```bash
+# Check what would run
+python batchrunner.py dispatch --dry-run
+
+# Run one slice (200 images) now
+python batchrunner.py --force faces_full --execute
+
+# Check progress
+python batchrunner.py status
+```
+
+Configuration in `batch_jobs/faces_full.yaml`:
+- **Slice size**: 200 images per tick
+- **Idle gate**: host load < 2.0 per CPU
+- **Allowed hours**: 0-7, 19-23 (nights)
+- **Priority**: batch (5) — lowest, never preempts
+
+## Cypher queries
+
 ```cypher
-// photos at "home" (South End) in 2025
-MATCH (m:Media)-[:LOCATED_AT|:CAPTURED_AT_TIME]->(sp:SummaryPlace {place_role:'home'})
-WHERE m.timestamp STARTS WITH '2025' RETURN m.path, m.timestamp
+// All Media nodes
+MATCH (m:Media) RETURN count(m)
 
-// after Scott labels a cluster: photos of Lexi
+// Photos at home in 2025
+MATCH (m:Media)-[:LOCATED_AT|:CAPTURED_AT_TIME]->(sp:SummaryPlace {place_role:'home'})
+WHERE m.timestamp STARTS WITH '2025'
+RETURN m.path, m.timestamp
+
+// Biggest face clusters (most common people)
+MATCH (fc:FaceCluster)-[:IDENTIFIES]->(p:Person)
+RETURN p.name, fc.member_count
+ORDER BY fc.member_count DESC LIMIT 20
+
+// Photos of a labeled person
 MATCH (p:Person {name:'Lexi'})<-[:IDENTIFIES]-(fc:FaceCluster)<-[:DEPICTS]-(m:Media)
 RETURN m.path, m.timestamp
+
+// Unlabeled clusters (need your input)
+MATCH (fc:FaceCluster)-[:IDENTIFIES]->(p:Person)
+WHERE p.labeled = false
+RETURN p.name, fc.member_count
+ORDER BY fc.member_count DESC
+
+// Photos with most faces (group shots)
+MATCH (m:Media)-[r:DEPICTS]->(fc:FaceCluster)
+RETURN m.path, count(r) AS faces
+ORDER BY faces DESC LIMIT 10
+
+// Find similar faces by embedding cosine similarity
+MATCH (fc:FaceCluster)
+RETURN fc.cluster_id, fc.member_count
+ORDER BY fc.member_count DESC
 ```
 
-### Remaining (not blockers, documented)
-- **Full face run**: `faces.py` on all 41k images is a multi-hour CPU job (insightface on
-  CPU). Sample validated; trigger full run when convenient (resumable via `_ingest/faces.done`).
-- **Cluster refinement**: greedy 0.5 threshold over-splits (33 clusters/45 faces on sample).
-  Improve with two-pass centroid matching or HDBSCAN.
-- **Human-in-loop labeling**: Scott renames `(Person {name:'Unknown N'})` → real name.
-  One-time per cluster; downstream queries resolve automatically.
-- **Video EXIF**: mov/mp4 get filename timestamps + null GPS (ffprobe not yet used).
-- **SummaryPlace.name is NULL** on all nodes (geo pipeline gap) — join by coords, not name.
+## Face classification UI
 
-## Batch-load scheduler (`batchrunner`)
-
-Long CPU jobs (the 41k face run) must NOT hammer the host or preempt fleet compute.
-`batchrunner.py` is a **priority-aware, idle-gated dispatcher** that drives any resumable
-batch command in safe slices.
-
-- **Manifest per job** (`batch_jobs/*.yaml`): `command`, `slice_size`, `priority`,
-  `idle_max_load`, `allowed_hours`, `slice_timeout_sec`, optional `post_slice`.
-- **Priority** aligns with the AssistX task enum: `critical=0 … batch=5`. Lower = sooner.
-  The face run is `priority: batch` (5) — lowest, runs only when idle.
-- **Idle gate**: 1-min host load < `idle_max_load` per CPU AND current hour ∈ `allowed_hours`.
-- **Slice execution**: one slice per dispatch tick (e.g. `faces.py --limit 200`), resumable
-  via the command's own done-file. Progress in `batch_state.json`.
-- **`--dry-run`**: prints the decision tree, executes nothing (prep/validate without load).
-- **Cron** `batchrunner-dispatch` (every 15 min) calls `batchrunner_dispatch.sh`.
-  The `faces_full.yaml` manifest is `enabled: false` → dispatcher correctly reports
-  "nothing runnable now". Flip `enabled: true` + it self-starts when host is idle.
-
-```
-# prep/preview — no execution:
-python batchrunner.py dispatch --dry-run
-python batchrunner.py --force faces_full --dry-run
-python batchrunner.py status
-# to actually start the face load:
-#   1. edit batch_jobs/faces_full.yaml: enabled: true
-#   2. cron fires every 15m, runs one 200-img slice when idle
+```bash
+python classify_ui.py
+# Opens http://localhost:8080
 ```
 
-This is generic: any resumable batch command (re-index, backfill, embed) drops in as a
-new manifest with a priority — the dispatcher orders and gates them all.
+The web UI shows face clusters sorted by size. For each cluster:
+- View all face thumbnails from that cluster
+- Enter a name to label the person
+- Skip to next cluster
+- Merge clusters if they're the same person
 
-### Per-slice side-effects + auto-completion
+Labels update Neo4j instantly — queries immediately reflect the new names.
 
-- **`post_slice`** (optional): a shell command run AFTER each successful slice (not in
-  dry-run). Used by `faces_full` to `docker cp` the fresh `face_embeddings.jsonl` +
-  `face_clusters.jsonl` + `faces.done` out of the container, then run `graph_faces.py`
-  — so face progress is queryable in Neo4j incrementally, not all-at-once at the end.
-- **`done_file` + `complete_when: done_file_stable`**: the dispatcher counts lines in
-  `done_file` each tick. When it stops growing between ticks (and ≥1 slice has run),
-  the resumable job has drained and the manifest is auto-marked `complete` — no manual
-  "is it done?" check. `faces_full` uses this: `faces.done` stops growing ⇒ 41k images
-  ingested ⇒ status flips to `complete`.
+## Project structure
 
-State (slices run, last run, done-file line count, status) persists in `batch_state.json`;
-`python batchrunner.py status` shows it.
-
-### Two job types
-
-- **`type: slice`** (e.g. `faces_full`): one-shot, resumable command driven in
-  chunks (`faces.py --limit 200`). The comand's own done-file makes re-runs safe.
-  Gated by host idle load + allowed_hours. Priority `batch` (5) = lowest.
-- **`type: service`** (e.g. `auto_ingest`): a long-lived background worker that is
-  ALREADY idle-gated + resumable on its own (`run_worker.sh`, 4-stage: speaker-link
-  → dashcam-compress → content-gen → Nextcloud ingest). batchrunner only LAUNCHES it
-  when the host is idle AND it isn't already running; otherwise skips. One control
-  surface for "is ingest alive?" without two idle-gates fighting. Priority
-  `background` (4) — launches before face slices if both are gated-open.
-
-The auto-ingest cron (`e6dfa93319c5`) was PAUSED 2026-06-10 (CPU hammering +
-a since-fixed missing-file bug). Rather than re-orchestrate its stages, batchrunner
-keeps the idle worker alive as a managed service. Flip `auto_ingest.yaml: enabled: true`
-to let the dispatcher relaunch it on idle hosts.
+```
+auto-classify/
+├── ac_config.py              # Constants and paths
+├── extract_metadata.py       # EXIF extraction → media_inventory.jsonl
+├── faces.py                  # Face detect/embed/cluster → JSONL
+├── graph_write.py            # Media nodes → Neo4j
+├── graph_faces.py            # Face/Person nodes → Neo4j
+├── classify_ui.py            # Web UI for labeling
+├── batchrunner.py            # Idle-gated batch dispatcher
+├── run_faces_npu.sh          # NPU environment wrapper
+├── requirements.txt          # Host-side Python deps
+├── batch_jobs/
+│   ├── faces_full.yaml       # Full face detection manifest
+│   └── auto_ingest.yaml      # Auto-ingest service manifest
+└── _ingest/                  # Generated output (on photos drive)
+    ├── media_inventory.jsonl
+    ├── face_embeddings.jsonl
+    ├── face_clusters.jsonl
+    └── faces.done
+```

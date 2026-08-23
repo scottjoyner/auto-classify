@@ -41,6 +41,17 @@
 PHOTOS_ROOT_IN_CONTAINER = "/var/www/html/data/admin/files/Photos"
 INGEST_DIR_IN_CONTAINER = "/var/www/html/data/admin/files/Photos/_ingest"
 
+# Host-side paths (for running on the host with NPU, not in Docker)
+PHOTOS_ROOT_HOST = "/media/scott/SSD_4TB/nextcloud_stage"
+INGEST_DIR_HOST = "/media/scott/SSD_4TB/nextcloud_stage/_ingest"
+
+# NPU environment (Ryzen AI Max Pro 390 — XDNA NPU via VitisAI EP)
+RYZEN_AI_VENV = "/media/scott/data/ryzen-ai-venv"
+RYZEN_AI_LIB = f"{RYZEN_AI_VENV}/lib/python3.12/site-packages/voe/lib"
+RYZEN_AI_ORT_LIB = f"{RYZEN_AI_VENV}/onnxruntime/lib"
+RYZEN_AI_DEPLOY_LIB = f"{RYZEN_AI_VENV}/deployment/lib"
+XRT_LIB = "/opt/xilinx/xrt/lib"
+
 # media extensions we handle
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mov", ".mp4", ".m4v"}

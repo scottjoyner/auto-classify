@@ -9,3 +9,6 @@ face_clusters.jsonl
 *.log
 batch_state.json
 batchrunner.pid
+
+# thumbnail cache
+.thumb_cache/

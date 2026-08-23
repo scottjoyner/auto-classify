@@ -13,18 +13,10 @@
 #   completes in a few idle days. Resumable — safe to pause/restart anytime.
 
 name: faces_full
-enabled: false          # flip to true + unpause cron to start
+enabled: true           # run face detection on all 10k images via NPU
 priority: batch         # 5 (lowest) — AssistX enum: critical0/high1/medium2/low3/bg4/batch5
 command: >-
-  docker exec nextcloud /tmp/facevenv/bin/python -c
-  "import sys; sys.path.insert(0,'/');
-   import faces;
-   faces.JSONL_IN='/var/www/html/data/admin/files/Photos/_ingest/media_inventory.jsonl';
-   faces.EMB_OUT='/var/www/html/data/admin/files/Photos/_ingest/face_embeddings.jsonl';
-   faces.CLUSTER_OUT='/var/www/html/data/admin/files/Photos/_ingest/face_clusters.jsonl';
-   faces.DONE_FILE='/var/www/html/data/admin/files/Photos/_ingest/faces.done';
-   import sys as _s; _s.argv=['faces'];
-   faces.main()"
+  /media/scott/data/git/auto-classify/run_faces_npu.sh
 slice_arg: "--limit"
 slice_size: 200
 slice_timeout_sec: 1800
@@ -34,19 +26,13 @@ allowed_hours: "0-7,19-23"
 max_failures: 3        # give up + flag after 3 consecutive slice failures
 backoff_min: 30        # exponential cooldown between retries (30,60,90,...min)
 stuck_ticks: 8         # if done_file flat for 8 ticks (~2h) with no error -> STUCK
-# after a slice, copy embeddings + done-file out + graph-write so progress is
-# queryable incrementally. (faces.done copy lets the host-side completion
-# heuristic read line count without exec-ing into the container each tick.)
+# after a slice, run graph_faces.py so progress is queryable in Neo4j incrementally.
 post_slice: >-
-  docker cp nextcloud:/var/www/html/data/admin/files/Photos/_ingest/face_embeddings.jsonl
-  /media/scott/SSD_4TB/auto-classify/face_embeddings.jsonl &&
-  docker cp nextcloud:/var/www/html/data/admin/files/Photos/_ingest/face_clusters.jsonl
-  /media/scott/SSD_4TB/auto-classify/face_clusters.jsonl &&
-  docker cp nextcloud:/var/www/html/data/admin/files/Photos/_ingest/faces.done
-  /media/scott/SSD_4TB/auto-classify/faces.done &&
-  /media/scott/SSD_4TB/auto-classify/venv/bin/python
-  /media/scott/SSD_4TB/auto-classify/graph_faces.py
+  /media/scott/data/ryzen-ai-venv/bin/python
+  /media/scott/data/git/auto-classify/graph_faces.py
+  --emb /media/scott/SSD_4TB/nextcloud_stage/_ingest/face_embeddings.jsonl
+  --clusters /media/scott/SSD_4TB/nextcloud_stage/_ingest/face_clusters.jsonl
 # completion: when the resumable faces.done stops growing between ticks, the
 # 41k-image job has drained -> mark complete automatically.
-done_file: /media/scott/SSD_4TB/auto-classify/faces.done
+done_file: /media/scott/SSD_4TB/nextcloud_stage/_ingest/faces.done
 complete_when: done_file_stable

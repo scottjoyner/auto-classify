@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-faces.py — detect + embed faces in Nextcloud photos via insightface (LOCAL, onnxruntime,
+faces.py — detect + embed faces in photos via insightface (LOCAL, onnxruntime,
 no cloud — privacy-wall compliant). Clusters faces by cosine similarity.
 
-RUN INSIDE the nextcloud container (reads the photo volume; insightface + opencv-headless
-live in /tmp/facevenv there). Outputs JSONL into the volume _ingest/ dir.
+Supports two modes:
+  1. Container mode (default): reads from nextcloud container path
+  2. Host mode (--photos-root): reads directly from host filesystem, uses NPU
+
+When VitisAIExecutionProvider is available (Ryzen NPU), uses it automatically.
+Falls back to CPUExecutionProvider if NPU is unavailable.
 
 Pipeline:
   for each Media (images only):
@@ -18,22 +22,123 @@ Pipeline:
 Idempotent/resumable: tracks processed media_ids in faces.done; re-run skips them.
 
 Usage:
+  # Container mode (original):
   docker exec nextcloud /tmp/facevenv/bin/python /work/faces.py [--limit 200] [--year 2025]
+
+  # Host mode (NPU-accelerated):
+  python faces.py --photos-root /media/scott/SSD_4TB/nextcloud_stage [--limit 200] [--year 2025]
 """
 import os, sys, json, argparse, traceback
-sys.path.insert(0, "/")
+
+# When running on host, ac_config is in the same directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ac_config as config
-from insightface.app import FaceAnalysis
+
 import numpy as np
 
-PHOTOS_ROOT = "/var/www/html/data/admin/files/Photos"
-INGEST_DIR = "/var/www/html/data/admin/files/Photos/_ingest"
-JSONL_IN = os.path.join(INGEST_DIR, "media_inventory.jsonl")
-EMB_OUT = os.path.join(INGEST_DIR, "face_embeddings.jsonl")
-CLUSTER_OUT = os.path.join(INGEST_DIR, "face_clusters.jsonl")
-DONE_FILE = os.path.join(INGEST_DIR, "faces.done")
-
 CLUSTER_THRESHOLD = 0.5  # cosine; insightface face embeddings ~0.5+ = same person
+
+
+def get_providers():
+    """Auto-detect available ORT providers, preferring NPU over CPU.
+    Falls back to CPU if VitisAI EP fails to initialize (known issue with
+    complex multi-model graphs like insightface's buffalo_l on Linux)."""
+    import onnxruntime as ort
+    available = ort.get_available_providers()
+    for pref in ["VitisAIExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]:
+        if pref in available:
+            return [pref]
+    return ["CPUExecutionProvider"]
+
+
+def init_face_analysis(providers):
+    """Initialize insightface FaceAnalysis, falling back to CPU if NPU crashes.
+
+    The VitisAI EP on Linux crashes (C++ abort) on some complex multi-model
+    graphs like insightface's buffalo_l. We detect this by running a quick
+    subprocess probe and fall back to CPU if it fails.
+    """
+    from insightface.app import FaceAnalysis
+
+    if "VitisAIExecutionProvider" in providers:
+        # Probe NPU in a subprocess (C++ abort can't be caught in-process)
+        probe_ok = _probe_npu_for_insightface()
+        if not probe_ok:
+            print("[faces] NPU probe failed, using CPU", flush=True)
+            providers = ["CPUExecutionProvider"]
+
+    app = FaceAnalysis(name="buffalo_l", providers=providers)
+    app.prepare(ctx_id=-1, det_size=(640, 640))
+    return app, providers[0]
+
+
+def _probe_npu_for_insightface():
+    """Test if VitisAI EP can handle insightface models (subprocess probe)."""
+    import subprocess, tempfile, textwrap
+    script = textwrap.dedent("""\
+        import os, sys
+        os.environ.setdefault("RYZEN_AI_INSTALLATION_PATH", "/media/scott/data/ryzen-ai-venv")
+        os.environ.setdefault("LD_PRELOAD", "/opt/xilinx/xrt/lib/libxrt_coreutil.so.2")
+        ld = os.environ.get("LD_LIBRARY_PATH", "")
+        for d in ["/media/scott/data/ryzen-ai-venv/lib/python3.12/site-packages/voe/lib",
+                   "/media/scott/data/ryzen-ai-venv/onnxruntime/lib",
+                   "/media/scott/data/ryzen-ai-venv/deployment/lib",
+                   "/opt/xilinx/xrt/lib"]:
+            if d not in ld:
+                ld = f"{d}:{ld}" if ld else d
+        os.environ["LD_LIBRARY_PATH"] = ld
+        import onnxruntime as ort
+        # Register VitisAI EP
+        from onnxruntime.capi import _pybind_state
+        lib = "/media/scott/data/ryzen-ai-venv/lib/python3.12/site-packages/voe/lib/libonnxruntime_vitisai_ep.so"
+        ort.register_execution_provider_library("VitisAIExecutionProvider", lib)
+        from insightface.app import FaceAnalysis
+        app = FaceAnalysis(name="buffalo_l", providers=["VitisAIExecutionProvider"])
+        app.prepare(ctx_id=-1, det_size=(640, 640))
+        print("NPU_PROBE_OK")
+    """)
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=300,
+            env={**os.environ,
+                 "RYZEN_AI_INSTALLATION_PATH": "/media/scott/data/ryzen-ai-venv",
+                 "LD_PRELOAD": "/opt/xilinx/xrt/lib/libxrt_coreutil.so.2",
+                 "LD_LIBRARY_PATH": ":".join([
+                     "/media/scott/data/ryzen-ai-venv/lib/python3.12/site-packages/voe/lib",
+                     "/media/scott/data/ryzen-ai-venv/onnxruntime/lib",
+                     "/media/scott/data/ryzen-ai-venv/deployment/lib",
+                     "/opt/xilinx/xrt/lib",
+                     os.environ.get("LD_LIBRARY_PATH", ""),
+                 ])}
+        )
+        return "NPU_PROBE_OK" in r.stdout
+    except Exception:
+        return False
+
+
+def setup_npu_env():
+    """Set environment variables needed for VitisAI EP on Ryzen NPU."""
+    if not hasattr(config, "RYZEN_AI_VENV"):
+        return
+    venv = config.RYZEN_AI_VENV
+    os.environ["RYZEN_AI_INSTALLATION_PATH"] = venv
+    os.environ.setdefault("LD_PRELOAD", "")
+    xrt_coreutil = f"/opt/xilinx/xrt/lib/libxrt_coreutil.so.2"
+    if xrt_coreutil not in os.environ.get("LD_PRELOAD", ""):
+        os.environ["LD_PRELOAD"] = f"{xrt_coreutil} {os.environ['LD_PRELOAD']}".strip()
+    lib_dirs = [
+        f"{venv}/lib/python3.12/site-packages/voe/lib",
+        f"{venv}/onnxruntime/lib",
+        f"{venv}/deployment/lib",
+        "/opt/xilinx/xrt/lib",
+    ]
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    for d in lib_dirs:
+        if d not in current:
+            current = f"{d}:{current}" if current else d
+    os.environ["LD_LIBRARY_PATH"] = current
+
 
 def load_media(jsonl, year=None, limit=None):
     rows = []
@@ -52,29 +157,62 @@ def load_media(jsonl, year=None, limit=None):
         rows = rows[:limit]
     return rows
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int)
     ap.add_argument("--year")
+    ap.add_argument("--photos-root", help="Host photos root (enables host mode with NPU)")
+    ap.add_argument("--output-dir", help="Directory for JSONL output (default: _ingest under photos-root)")
     args = ap.parse_args()
 
-    app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-    app.prepare(ctx_id=-1, det_size=(640, 640))
-    print("[faces] insightface ready", flush=True)
+    # Determine paths based on mode
+    if args.photos_root:
+        photos_root = args.photos_root
+        ingest_dir = args.output_dir or os.path.join(photos_root, "_ingest")
+    else:
+        photos_root = config.PHOTOS_ROOT_IN_CONTAINER
+        ingest_dir = config.INGEST_DIR_IN_CONTAINER
 
-    media = load_media(JSONL_IN, year=args.year, limit=args.limit)
-    print(f"[faces] {len(media)} images to process", flush=True)
+    jsonl_in = os.path.join(ingest_dir, "media_inventory.jsonl")
+    emb_out = os.path.join(ingest_dir, "face_embeddings.jsonl")
+    cluster_out = os.path.join(ingest_dir, "face_clusters.jsonl")
+    done_file = os.path.join(ingest_dir, "faces.done")
+
+    os.makedirs(ingest_dir, exist_ok=True)
+
+    # Setup NPU if running on host
+    if args.photos_root:
+        setup_npu_env()
+
+    # Detect providers and initialize face analysis
+    import onnxruntime as ort
+    providers = get_providers()
+    print(f"[faces] ORT providers: {ort.get_available_providers()}", flush=True)
+    print(f"[faces] using: {providers[0]}", flush=True)
+
+    app, active_provider = init_face_analysis(providers)
+    print(f"[faces] insightface ready (provider: {active_provider})", flush=True)
+
+    media = load_media(jsonl_in, year=args.year)
+    print(f"[faces] {len(media)} images total", flush=True)
 
     done = set()
-    if os.path.exists(DONE_FILE):
-        with open(DONE_FILE) as f:
+    if os.path.exists(done_file):
+        with open(done_file) as f:
             done = set(l.strip() for l in f if l.strip())
+
+    # Filter out already-processed images, then apply limit
+    media = [r for r in media if r["media_id"] not in done]
+    if args.limit:
+        media = media[:args.limit]
+    print(f"[faces] {len(media)} images to process (skipped {len(done)} already done)", flush=True)
 
     # load existing embeddings to extend clusters
     clusters = {}  # cluster_id -> list of embeddings (np arrays)
     next_cid = 0
-    if os.path.exists(CLUSTER_OUT):
-        with open(CLUSTER_OUT) as f:
+    if os.path.exists(cluster_out):
+        with open(cluster_out) as f:
             for line in f:
                 c = json.loads(line)
                 clusters[c["cluster_id"]] = clusters.get(c["cluster_id"], [])
@@ -96,7 +234,7 @@ def main():
         return cid
 
     n_faces = 0
-    with open(EMB_OUT, "a") as ef, open(DONE_FILE, "a") as df:
+    with open(emb_out, "a") as ef, open(done_file, "a") as df:
         for i, r in enumerate(media, 1):
             mid = r["media_id"]
             if mid in done:
@@ -106,7 +244,6 @@ def main():
                 if not os.path.exists(path):
                     df.write(mid + "\n"); continue
                 from PIL import Image
-                import numpy as np
                 img = np.array(Image.open(path).convert("RGB"))
                 faces_det = app.get(img)
                 for fi, fc in enumerate(faces_det):
@@ -129,10 +266,11 @@ def main():
                 print(f"[faces] {i}/{len(media)} images | faces={n_faces} clusters={next_cid}", flush=True)
 
     # write cluster summary
-    with open(CLUSTER_OUT, "w") as cf:
+    with open(cluster_out, "w") as cf:
         for cid, embs in clusters.items():
             cf.write(json.dumps({"cluster_id": cid, "member_count": len(embs)}) + "\n")
     print(f"[faces] DONE: {n_faces} faces across {next_cid} clusters", flush=True)
+
 
 if __name__ == "__main__":
     main()
