@@ -1,5 +1,12 @@
 # auto-classify
 
+<!-- repo-entrypoint-guide:start -->
+> **Start here:** The workflow indexes authorized photo/video archives into metadata and face embeddings before writing to Neo4j. Read [What it does](#what-it-does), [Quick start](#quick-start), and [Output files](#output-files) in that order.
+> 
+> **Privacy and reproducibility:** Face labeling and location data are sensitive. Test against an approved subset, keep raw media and embeddings out of public commits, and validate graph ownership and deduplication before enabling batch writes.
+<!-- repo-entrypoint-guide:end -->
+
+
 Ingest photo/video archives into Neo4j so media becomes graph-searchable by
 **time**, **location**, and **person**. Designed for the Nextcloud `Photos/`
 iOS instant-upload feed (~117GB, ~41k files, 2007–2026).
