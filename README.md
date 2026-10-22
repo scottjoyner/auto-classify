@@ -1,9 +1,19 @@
 # auto-classify
 
 <!-- repo-entrypoint-guide:start -->
-> **Start here:** The workflow indexes authorized photo/video archives into metadata and face embeddings before writing to Neo4j. Read [What it does](#what-it-does), [Quick start](#quick-start), and [Output files](#output-files) in that order.
-> 
-> **Privacy and reproducibility:** Face labeling and location data are sensitive. Test against an approved subset, keep raw media and embeddings out of public commits, and validate graph ownership and deduplication before enabling batch writes.
+## Repository guide
+
+**Start here:** The workflow indexes authorized photo/video archives into metadata and face embeddings before writing to Neo4j. Read [What it does](#what-it-does), [Quick start](#quick-start), and [Output files](#output-files) in that order.
+
+**Privacy and reproducibility:** Face labeling and location data are sensitive. Test against an approved subset, keep raw media and embeddings out of public commits, and validate graph ownership and deduplication before enabling batch writes.
+
+### Find your way
+
+- [What it does](#what-it-does)
+- [Hardware](#hardware)
+- [Quick start](#quick-start)
+- [Scripts](#scripts)
+- [Output files](#output-files)
 <!-- repo-entrypoint-guide:end -->
 
 
