@@ -35,7 +35,7 @@ Photos/ ──► extract_metadata.py ──► media_inventory.jsonl ──► 
 - **Location**: EXIF GPS (86% coverage) joined by haversine to `SummaryPlace` nodes (≤50km)
 - **Person**: `insightface` local face detect → 512-d embedding → greedy cluster → you label
 
-Then: *"photos of Lexi at the beach in June 2025"* is a one-hop Cypher query.
+Then: *"photos from a beach trip in June 2025"* is a one-hop Cypher query.
 
 ## Hardware
 
@@ -44,25 +44,27 @@ Then: *"photos of Lexi at the beach in June 2025"* is a one-hop Cypher query.
 | CPU | AMD Ryzen AI Max Pro 390 (24 threads) |
 | NPU | XDNA NPU via VitisAI Execution Provider |
 | RAM | 24GB |
-| Storage | `/media/scott/SSD_4TB/` (NVMe) |
-| Photos | `/media/scott/SSD_4TB/nextcloud_stage/` |
+| Storage | `/path/to/storage/` (NVMe) |
+| Photos | `/path/to/approved/photos/` |
 
 ## Quick start
 
+The paths below are placeholders: replace `/path/to/approved/photos` with a test copy of media you are authorized to process. The graph-writing commands change Neo4j state, and face embeddings/location metadata require restricted storage and appropriate consent. Start with a small sample.
+
 ```bash
 # 1. Generate media inventory
-python extract_metadata.py --photos-root /media/scott/SSD_4TB/nextcloud_stage
+python extract_metadata.py --photos-root /path/to/approved/photos
 
 # 2. Write to Neo4j
-python graph_write.py --jsonl /media/scott/SSD_4TB/nextcloud_stage/_ingest/media_inventory.jsonl
+python graph_write.py --jsonl /path/to/approved/photos/_ingest/media_inventory.jsonl
 
 # 3. Run face detection (NPU-accelerated)
 ./run_faces_npu.sh --limit 200
 
 # 4. Load faces into Neo4j
 python graph_faces.py \
-  --emb /media/scott/SSD_4TB/nextcloud_stage/_ingest/face_embeddings.jsonl \
-  --clusters /media/scott/SSD_4TB/nextcloud_stage/_ingest/face_clusters.jsonl
+  --emb /path/to/approved/photos/_ingest/face_embeddings.jsonl \
+  --clusters /path/to/approved/photos/_ingest/face_clusters.jsonl
 
 # 5. Label faces in the web UI
 python classify_ui.py
